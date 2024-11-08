@@ -1,0 +1,13 @@
+torch==2.0.0
+torchaudio==2.0.1
+transformers==4.30.2
+openai-whisper==20230314
+pyannote.audio>=2.1
+numpy<2.0
+scipy
+scikit-learn
+hmmlearn
+matplotlib
+pydub
+eyed3
+plotly
