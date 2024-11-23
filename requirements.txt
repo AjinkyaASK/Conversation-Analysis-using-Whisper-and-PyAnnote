@@ -1,13 +1,10 @@
-torch==2.0.0
-torchaudio==2.0.1
-transformers==4.30.2
-openai-whisper==20230314
-pyannote.audio>=2.1
-numpy<2.0
-scipy
-scikit-learn
-hmmlearn
-matplotlib
-pydub
-eyed3
-plotly
+fastapi
+pydantic
+ollama
+huggingface_hub<0.24
+numpy<2
+wget
+nemo_toolkit[asr]==2.0.0rc0
+nltk
+git+https://github.com/SYSTRAN/faster-whisper.git #Reaplce with 'faster-whisper==VERSION' once a new version with BatchedInferencePipeline is deployed to PYPI
+git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git

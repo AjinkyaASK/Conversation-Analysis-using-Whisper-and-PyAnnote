@@ -1,121 +1,190 @@
 import os
 import sys
-import whisper
-from pyannote.audio import Pipeline
-from loader import Loader
+import uuid
+import faster_whisper
+import torch
+import torchaudio
+import ollama
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-AUDIO_FILE_PATH = "src/asset/sample_audio_1.mp3"
-AUDIO_FILE_LANGUAGE = "en"
-HF_TOKEN = "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"
+from ctc_forced_aligner import (
+    generate_emissions,
+    get_alignments,
+    get_spans,
+    load_alignment_model,
+    postprocess_results,
+    preprocess_text,
+)
+from nemo.collections.asr.models.msdd_models import NeuralDiarizer
 
-def transcribe_audio(file_path, language):
-    print("\nStarting transcription...")
-    loader = Loader(message="Transcribing audio... ")
-    loader.start()
-    
-    # Load Whisper model
-    model = whisper.load_model("large")
-    
-    # Transcribe the audio file into segments
-    result = model.transcribe(file_path, language=language, task="transcribe", word_timestamps=True)
-    print("Transcription raw result", result)
-    segments = result['segments']
-    
-    loader.stop()
-    print("\nTranscription complete!")
-    
-    return segments
+from helpers import (
+    deleteFileOrDir,
+    create_config,
+    get_sentences_speaker_mapping,
+    get_speaker_aware_transcript,
+    get_words_speaker_mapping,
+    langs_to_iso,
+    write_srt,
+)
+from prompt import QNA_PROMPT_MESSAGE
 
-def speaker_diarization(file_path):
-    print("\nStarting speaker diarization...")
-    
-    loader = Loader(message="Speaker diarization in progress... ")
-    loader.start()
-    
-    # Load the speaker diarization pipeline
-    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization", use_auth_token=HF_TOKEN)
-    diarization = pipeline({"uri": file_path, "audio": file_path})
+app = FastAPI()
 
-    # Parse result
-    speaker_segments = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        speaker_segments.append((turn.start, turn.end, speaker))
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class InterviewAnalysisRequest(BaseModel):
+    audio_url: str
+
+LLM = "llama3"
+TEMPERATURE = 0.2
+
+def create_prompt(transcription: str) -> str:
+    return QNA_PROMPT_MESSAGE.replace("<TRANSCRIPTION>", transcription)
+
+# Configuration
+COMPUTING_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+WHISPER_MODEL = "medium.en"
+WHISPER_BATCH_SIZE = 8
+mtypes = {"cpu": "int8", "cuda": "float16"}
+language = None
+
+@app.post("/analyse_interview")
+async def analyse_error(request: InterviewAnalysisRequest):
+    # Generate unique session directory
+    session_id = str(uuid.uuid4())
+    session_path = os.path.join("src/temp_outputs", session_id)
+    os.makedirs(session_path, exist_ok=True)
+
+    # AUDIO_FILE_PATH = request.audio_url
+
+    # if not os.path.exists(AUDIO_FILE_PATH):
+    #     sys.exit(f"Audio file does not exist. Path provided: {AUDIO_FILE_PATH}")
+
+    # Transcribe the audio file
+    whisper_model = faster_whisper.WhisperModel(
+        WHISPER_MODEL,
+        device=COMPUTING_DEVICE,
+        compute_type=mtypes[COMPUTING_DEVICE]
+    )
+    whisper_pipeline = faster_whisper.BatchedInferencePipeline(whisper_model)
+    audio_waveform = faster_whisper.decode_audio(request.audio_url)
+    audio_waveform_tensors = torch.from_numpy(audio_waveform)
+
+    transcript_segments, transcript_info = whisper_pipeline.transcribe(
+        audio_waveform,
+        batch_size=WHISPER_BATCH_SIZE
+    )
+
+    full_transcript = "".join(segment.text for segment in transcript_segments)
+    
+    # return {"unprocessed transcript": full_transcript}
+
+    # clear gpu vram
+    # del whisper_model, whisper_pipeline
+    # torch.cuda.empty_cache()
+
+    # Forced Alignment
+    alignment_model, alignment_tokenizer = load_alignment_model(
+        COMPUTING_DEVICE,
+        dtype=torch.float16 if COMPUTING_DEVICE == "cuda" else torch.float32,
+    )
+
+    emissions, stride = generate_emissions(
+        alignment_model,
+        audio_waveform_tensors.to(alignment_model.dtype).to(alignment_model.device),
+        batch_size=WHISPER_BATCH_SIZE
+    )
+
+    # clear gpu vram
+    # del alignment_model
+    # torch.cuda.empty_cache()
+
+    tokens_starred, text_starred = preprocess_text(
+        full_transcript,
+        romanize=True,
+        language=langs_to_iso[transcript_info.language],
+    )
+
+    segments, scores, blank_token = get_alignments(
+        emissions,
+        tokens_starred,
+        alignment_tokenizer,
+    )
+
+    spans = get_spans(tokens_starred, segments, blank_token)
+
+    word_timestamps = postprocess_results(text_starred, spans, stride, scores)
+
+    # Convert audio to mono for NeMo compatibility
+    mono_audio_path = os.path.join(session_path, "mono_file.wav")
+    torchaudio.save(
+        mono_audio_path,
+        audio_waveform_tensors.cpu().unsqueeze(0).float(),
+        16000
+    )
+
+    # Initialize NeMo MSDD diarization model
+    msdd_model = NeuralDiarizer(cfg=create_config(session_path)).to(COMPUTING_DEVICE)
+    msdd_model.diarize()
+
+    # clear gpu vram
+    del msdd_model
+    torch.cuda.empty_cache()
+
+    # Reading timestamps <> Speaker Labels mapping
+    speaker_ts = []
+    rttm_path = os.path.join(session_path, "pred_rttms", "mono_file.rttm")
+    with open(rttm_path, "r") as f:
+        lines = f.readlines()
+        for line in lines:
+            line_list = line.split(" ")
+            s = int(float(line_list[5]) * 1000)
+            e = s + int(float(line_list[8]) * 1000)
+            speaker_ts.append([s, e, int(line_list[11].split("_")[-1])])
+
+    wsm = get_words_speaker_mapping(word_timestamps, speaker_ts, "start")
+    ssm = get_sentences_speaker_mapping(wsm, speaker_ts)
+
+    # Write output files in session-specific paths
+    # transcript_txt_path = os.path.join(session_path, f"{session_id}.txt")
+    # transcript_srt_path = os.path.join(session_path, f"{session_id}.srt")
+    # with open(transcript_txt_path, "w", encoding="utf-8-sig") as f:
+    #     get_speaker_aware_transcript(ssm, f)
+    # with open(transcript_srt_path, "w", encoding="utf-8-sig") as srt:
+    #     write_srt(ssm, srt)
         
-    loader.stop()
-    print("\nSpeaker diarization complete!")
+    processed_transcript = get_speaker_aware_transcript(ssm)
     
-    return speaker_segments
+    # return {"transcript": processed_transcript}
 
-def format_conversation(transcription, speaker_segments):
-    formatted_conversation = []
-    speaker_index = 0
-    
-    # Iterate over segments and assign them to speakers based on timing
-    for segment in transcription:
-        segment_start = segment['start']
-        segment_text = segment['text']
+    # Cleanup after processing
+    # deleteFileOrDir(session_path)
         
-        # Find the matching speaker segment for this word based on start time
-        while (speaker_index < len(speaker_segments) and 
-               speaker_segments[speaker_index][1] < segment_start):
-            speaker_index += 1
-
-        if speaker_index < len(speaker_segments):
-            start, end, speaker = speaker_segments[speaker_index]
+    prompt = create_prompt(processed_transcript)
             
-            # Check if the word timestamp falls within the speaker segment
-            if start <= segment_start <= end:
-                speaker_id = f"Speaker {speaker}"
-                formatted_conversation.append({
-                    "speaker": speaker_id,
-                    "text": segment_text
-                })
+    response = ollama.chat(
+        model=LLM,
+        options={"temperature": TEMPERATURE},
+        messages=[{"role": "user", "content": prompt}],
+    )
 
-    # Combine consecutive words for the same speaker
-    combined_conversation = []
-    current_speaker = None
-    current_text = []
+    response_text = response.get("message", {}).get("content", "")
+    cleaned_response_text = response_text.strip().replace('\\n', ' ').replace('\\"', '"')
 
-    for entry in formatted_conversation:
-        if entry['speaker'] == current_speaker:
-            current_text.append(entry['text'])
-        else:
-            if current_text:
-                combined_conversation.append({
-                    "speaker": current_speaker,
-                    "text": " ".join(current_text)
-                })
-            current_speaker = entry['speaker']
-            current_text = [entry['text']]
+    # try:
+    #     response_json = json.loads(cleaned_response_text)
+    #     if not all(key in response_json for key in ["cause", "impact", "fix"]):
+    #         raise ValueError("Invalid response format")
+    # except (json.JSONDecodeError, ValueError) as e:
+    #     print(f"Failed to parse response: {cleaned_response_text}")
+    #     raise HTTPException(status_code=500, detail=f"Invalid response format: {str(e)}")
 
-    # Add the last accumulated text
-    if current_text:
-        combined_conversation.append({
-            "speaker": current_speaker,
-            "text": " ".join(current_text)
-        })
-
-    return combined_conversation
-
-def main():
-    if not os.path.isfile(AUDIO_FILE_PATH):
-        print("File not found.")
-        sys.exit(1)
-
-    # Transcribe audio
-    transcription = transcribe_audio(AUDIO_FILE_PATH, AUDIO_FILE_LANGUAGE)
-    print("Transcription:", transcription)
-    
-    # Speaker Diarization
-    speaker_segments = speaker_diarization(AUDIO_FILE_PATH)
-    print("Speaker Segments:", speaker_segments)
-
-    # Format structured conversation
-    structured_conversation = format_conversation(transcription, speaker_segments)
-    
-    # Show results
-    for entry in structured_conversation:
-        print(f"{entry['speaker']}: {entry['text']}")
-
-if __name__ == "__main__":
-    main()
+    return {"analysis": cleaned_response_text}
